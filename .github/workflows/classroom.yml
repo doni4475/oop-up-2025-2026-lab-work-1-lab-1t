@@ -1,0 +1,187 @@
+name: Checking lab work
+
+on: [push]
+
+permissions:
+  checks: write
+  actions: read
+  contents: read
+
+jobs:
+  build:
+    name: Autograding + Static Analysis + ChatGPT
+    runs-on: ubuntu-latest
+
+    # cSecret available at job level (org/repo secret OPENAI_API_KEY)
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # 1) Project compilation
+      - name: Compile (skip tests)
+        run: mvn -B -ntp -DskipTests=true clean package
+
+      # 2) Unit tests
+      - name: Run Unit Tests
+        run: mvn -B -ntp test
+
+      # 3) Checkstyle-report
+      - name: Run Checkstyle
+        run: mvn -B -ntp checkstyle:checkstyle
+
+      - name: Archive Checkstyle Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkstyle-report
+          path: |
+            target/checkstyle-result.xml
+            target/site/checkstyle.html
+          if-no-files-found: warn
+
+      # ==== ChatGPT: review only Main.java ====
+      - name: Collect Main.java only
+        id: target
+        run: |
+          # search for all tracked files named Main.java
+          git ls-files | grep -Ei '(^|/)Main\.java$' > java_files_for_review.txt || true
+          COUNT=$(wc -l < java_files_for_review.txt | xargs)
+          echo "Found Main.java files: $COUNT."
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          if [ "$COUNT" -gt 0 ]; then
+            echo "has_files=true" >> $GITHUB_OUTPUT
+            echo "List:"; cat java_files_for_review.txt
+          else
+            echo "has_files=false" >> $GITHUB_OUTPUT
+            echo "Main.java not found - ChatGPT step will create a stub."
+          fi
+
+      - name: ChatGPT code review (Main.java only, Markdown output)
+        if: ${{ steps.target.outputs.has_files == 'true' }}
+        env:
+          OPENAI_API_KEY: ${{ env.OPENAI_API_KEY }}
+          CHATGPT_MODEL: gpt-5-nano
+          CHATGPT_PROMPT: >
+            Проаналізуй наступний код студента мовою Java.
+            Перевір коректність виконання завдання: чи відповідає код умові, чи немає логічних помилок, чи працює програма для різних вхідних даних.
+            Перевір оформлення коду.
+            Склади звіт у двох розділах:
+            Коректність коду - перерахуй знайдені помилки або вкажи, що код працює правильно.
+            Стиль коду - перерахуй порушення стилю, запропонуй поліпшення.
+            Не треба писати нічого крім відповіді. Не треба нічого пропонувати.
+            Оцінити роботу загалом за 100 бальною оцінкою.
+        run: |
+          set -e
+          mkdir -p chatgpt
+
+          # If the key is unavailable - create an understandable stub and exit without error
+          if [ -z "$OPENAI_API_KEY" ]; then
+            {
+              echo "# ChatGPT Review Report (Main.java only)"
+              echo
+              echo "_Not generated._"
+              echo
+              echo "**Reason:** OPENAI_API_KEY is not available to this run."
+            } > chatgpt/chatgpt_report.md
+            exit 0
+          fi
+
+          python3 -m pip install --upgrade pip requests
+
+          cat > gpt_review.py << 'PY'
+          import os, json, pathlib, requests
+
+          api_key = os.environ["OPENAI_API_KEY"]
+          model   = os.environ.get("CHATGPT_MODEL","gpt-5-nano")
+          system_instructions = os.environ.get("CHATGPT_PROMPT") or (
+            "You are a precise, terse, actionable senior Java reviewer. "
+            "Respond in **Markdown only** (lists, headings, code blocks). No JSON or YAML."
+          )
+
+          files = [p.strip() for p in open("java_files_for_review.txt","r",encoding="utf-8").read().splitlines() if p.strip()]
+          def load(p):
+            try:
+              return open(p,"r",encoding="utf-8",errors="ignore").read()
+            except Exception as e:
+              return f"<<unable to read: {e}>>"
+
+          # Chunked payload assembly (~80k characters)
+          CHUNK_LIMIT = 80000
+          chunks, buf = [], ""
+          for fp in files:
+            unit = f"\n\n### FILE: {fp}\n```java\n{load(fp)}\n```\n"
+            if len(buf) + len(unit) > CHUNK_LIMIT and buf:
+              chunks.append(buf); buf = ""
+            buf += unit
+          if buf.strip(): chunks.append(buf)
+
+          headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+          out_md = ["# ChatGPT Review Report (Main.java only)", f"- Model: `{model}`", f"- Files analyzed: {len(files)}"]
+
+          def post_text(payload: str):
+            # In the Responses API, the format is set via text.format (not response_format)
+            body = {
+              "model": model,
+              "instructions": system_instructions,
+              "input": payload,
+              "text": { "format": { "type": "text" } }
+            }
+            return requests.post(
+              "https://api.openai.com/v1/responses",
+              headers=headers, data=json.dumps(body), timeout=300
+            )
+
+          for i, payload in enumerate(chunks, start=1):
+            try:
+              r = post_text(payload)
+              if r.status_code != 200:
+                # Short and to the point, no raw JSON
+                msg = ""
+                try:
+                  msg = r.json().get("error",{}).get("message","")
+                except Exception:
+                  msg = r.text[:800]
+                out_md.append(f"\n\n## Chunk {i}\n_API error {r.status_code}: {msg or 'see logs'}_")
+                continue
+
+              data = r.json()
+              # Often text is available in output_text, but keep a fallback path
+              text = data.get("output_text")
+              if not text:
+                parts = []
+                for item in (data.get("output") or []):
+                  content = item.get("content") if isinstance(item, dict) else None
+                  if isinstance(content, list):
+                    parts += [c.get("text","") for c in content if isinstance(c, dict)]
+                text = "\n".join([p for p in parts if p]) or "_(No textual content parsed.)_"
+              out_md.append(f"\n\n## Chunk {i}\n{text.strip()}")
+            except Exception as e:
+              out_md.append(f"\n\n## Chunk {i}\n_Request failed: {e}_")
+
+          pathlib.Path("chatgpt/chatgpt_report.md").write_text("\n".join(out_md), encoding="utf-8")
+          PY
+          python3 gpt_review.py
+
+      # We guarantee an artifact (even if the above step was skipped or dropped)
+      - name: Ensure ChatGPT report exists (stub if missing)
+        if: always()
+        run: |
+          if [ ! -f chatgpt/chatgpt_report.md ]; then
+            mkdir -p chatgpt
+            printf "# ChatGPT Review Report\n\n_Not generated._\n\n**Reason:** unknown (see logs)\n" > chatgpt/chatgpt_report.md
+          fi
+
+      - name: Upload ChatGPT Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-report
+          path: chatgpt/chatgpt_report.md
+          if-no-files-found: error
