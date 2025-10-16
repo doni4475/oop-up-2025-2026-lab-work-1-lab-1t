@@ -24,6 +24,7 @@ public class Main {
     }
 
     // ======== Boolean expressions ========
+    // test workflow trigger
 
     public boolean sleepIn(boolean weekday, boolean vacation) {
         return !weekday || vacation;
